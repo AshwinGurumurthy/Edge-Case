@@ -4,6 +4,7 @@
 # Python
 __pycache__/
 *.py[cod]
+*.pyc
 .venv/
 venv/
 env/
@@ -14,3 +15,8 @@ env/
 .DS_Store
 .vscode/
 .idea/
+
+# scan / scenario outputs
+scan_context.md
+scenarios.md
+*-scenarios.md

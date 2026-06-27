@@ -1,8 +1,13 @@
 """The scanner LangGraph node.
 
-It collects a target codebase (static), then asks Claude Sonnet to synthesize a
-single structured `ScanContext`. The node writes that context onto graph state so
+It collects a target codebase (static), then asks an LLM to synthesize a single
+structured `ScanContext`. The node writes that context onto graph state so
 downstream agents can build on it.
+
+Backend selection (so the MVP runs with or without a cloud key):
+  - If ANTHROPIC_API_KEY is set  -> Claude (best quality, big context).
+  - Otherwise, if a local Ollama is reachable -> local model (free, offline).
+  - Force one with SCANNER_BACKEND=anthropic|ollama.
 """
 
 from __future__ import annotations
@@ -10,7 +15,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 
-import anthropic
+import requests
 from dotenv import load_dotenv
 
 from .collector import DEFAULT_MAX_CHARS, CollectedCode, collect
@@ -19,9 +24,15 @@ from .state import GraphState, ScanContext
 # Load .env so ANTHROPIC_API_KEY (and optional overrides) are available.
 load_dotenv()
 
-MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 # Adaptive thinking tokens + the structured JSON share this budget.
 MAX_TOKENS = int(os.getenv("SCANNER_MAX_TOKENS", "12000"))
+
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "granite4:micro")
+# Local models have smaller context windows than Claude, so the snapshot sent to
+# Ollama is capped well below the collection budget.
+OLLAMA_MAX_BLOB_CHARS = int(os.getenv("OLLAMA_MAX_BLOB_CHARS", "45000"))
 
 SYSTEM_PROMPT = """You are a codebase scanner agent inside a multi-agent system. \
 Your single job is to read a snapshot of a software project and produce a precise, \
@@ -46,21 +57,32 @@ guessing, and record the gap under assumptions.
 - Set confidence honestly based on how much signal the snapshot actually contained \
 (a truncated or sparse snapshot should lower confidence)."""
 
+USER_PREFIX = "Analyze the following codebase snapshot and return the structured context.\n\n"
+
+
+def select_backend() -> str:
+    """Decide which backend to use. Explicit override wins; else key presence."""
+    forced = os.getenv("SCANNER_BACKEND", "").strip().lower()
+    if forced in ("anthropic", "ollama"):
+        return forced
+    if os.getenv("ANTHROPIC_API_KEY"):
+        return "anthropic"
+    return "ollama"
+
 
 @lru_cache(maxsize=1)
-def get_client() -> anthropic.Anthropic:
-    """Lazily construct a single Anthropic client (10-minute default timeout)."""
+def get_anthropic_client():
+    """Lazily construct a single Anthropic client (imported lazily so the
+    package works without the SDK installed when running on Ollama)."""
+    import anthropic
+
     return anthropic.Anthropic()
 
 
-def synthesize(collected: CollectedCode) -> ScanContext:
-    """Run the structured synthesis pass over collected code."""
-    client = get_client()
-
-    user_blob = collected.render()
-
+def _synthesize_anthropic(user_blob: str) -> ScanContext:
+    client = get_anthropic_client()
     response = client.messages.parse(
-        model=MODEL,
+        model=ANTHROPIC_MODEL,
         max_tokens=MAX_TOKENS,
         thinking={"type": "adaptive"},
         system=[
@@ -71,25 +93,55 @@ def synthesize(collected: CollectedCode) -> ScanContext:
                 "cache_control": {"type": "ephemeral"},
             }
         ],
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "Analyze the following codebase snapshot and return the "
-                    "structured context.\n\n" + user_blob
-                ),
-            }
-        ],
+        messages=[{"role": "user", "content": USER_PREFIX + user_blob}],
         output_format=ScanContext,
     )
-
     if getattr(response, "stop_reason", None) == "refusal":
         raise RuntimeError("model refused to analyze the codebase")
-
     context = response.parsed_output
     if context is None:
         raise RuntimeError("model did not return a parseable ScanContext")
     return context
+
+
+def _synthesize_ollama(user_blob: str) -> ScanContext:
+    # Local context windows are small; trim the snapshot and tell the model.
+    if len(user_blob) > OLLAMA_MAX_BLOB_CHARS:
+        user_blob = (
+            user_blob[:OLLAMA_MAX_BLOB_CHARS]
+            + "\n... [snapshot trimmed to fit local model context]"
+        )
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": USER_PREFIX + user_blob},
+        ],
+        "format": ScanContext.model_json_schema(),
+        "stream": False,
+        "options": {"temperature": 0},
+    }
+    try:
+        resp = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=600)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Ollama request to {OLLAMA_HOST} failed ({exc}). Is `ollama serve` "
+            f"running and is model '{OLLAMA_MODEL}' pulled?"
+        ) from exc
+    content = resp.json().get("message", {}).get("content", "")
+    if not content:
+        raise RuntimeError("Ollama returned an empty response")
+    return ScanContext.model_validate_json(content)
+
+
+def synthesize(collected: CollectedCode) -> ScanContext:
+    """Run the structured synthesis pass over collected code."""
+    user_blob = collected.render()
+    backend = select_backend()
+    if backend == "anthropic":
+        return _synthesize_anthropic(user_blob)
+    return _synthesize_ollama(user_blob)
 
 
 def scanner_node(state: GraphState) -> GraphState:
@@ -109,10 +161,11 @@ def scanner_node(state: GraphState) -> GraphState:
     except Exception as exc:  # noqa: BLE001 — surface any collection failure to the graph
         return {"scan_error": f"collection failed: {exc}"}
 
+    backend = select_backend()
     try:
         context = synthesize(collected)
     except Exception as exc:  # noqa: BLE001 — surface any synthesis failure to the graph
-        return {"scan_error": f"synthesis failed: {exc}"}
+        return {"scan_error": f"synthesis failed ({backend}): {exc}"}
 
     meta = {
         "root": collected.root,
@@ -120,6 +173,7 @@ def scanner_node(state: GraphState) -> GraphState:
         "files_scanned": collected.files_scanned,
         "files_total": collected.files_total,
         "truncated": collected.truncated,
+        "backend": backend,
     }
 
     # Optionally emit the context as a .md file for humans / other tools.
