@@ -1,0 +1,10 @@
+Drill: DB Down. We stopped the Postgres container backing the demo checkout app.
+Within 0.8s the /checkout endpoint began returning HTTP 500s. Success rate fell to
+41%, p95 latency climbed to 4200ms, and 137 errors were logged in the first minute.
+The app container health flipped to "degraded". There are no retries, timeouts, or
+circuit breakers on the DB call path.
+
+Questions:
+- What exactly failed and what is the blast radius?
+- How severe is this?
+- What should we fix before real users hit this in production?
