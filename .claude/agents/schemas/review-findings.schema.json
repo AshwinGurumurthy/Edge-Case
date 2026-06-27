@@ -1,0 +1,90 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "review-findings.schema.json",
+  "title": "Code-review findings contract",
+  "description": "Shared contract for the code-quality cluster. The `scalability` and `clean-code` skill sub-agents each emit a SkillReport. The `general` sub-agent ingests one or more SkillReports and emits a MergedReport.",
+  "definitions": {
+    "severity": {
+      "type": "string",
+      "enum": ["blocking", "high", "medium", "low", "nit"]
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["high", "medium", "low"]
+    },
+    "finding": {
+      "type": "object",
+      "required": ["id", "skill", "severity", "file", "title"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "description": "Stable id, e.g. 'scal-001' or 'clean-003'." },
+        "skill": { "type": "string", "enum": ["scalability", "clean-code"] },
+        "severity": { "$ref": "#/definitions/severity" },
+        "category": { "type": "string", "description": "e.g. 'n+1-query', 'memory-growth', 'duplication', 'naming', 'deep-nesting'." },
+        "file": { "type": "string" },
+        "line": { "type": ["integer", "null"], "description": "1-based line, or null if file-level." },
+        "title": { "type": "string", "description": "Short one-line summary." },
+        "detail": { "type": "string", "description": "Why it matters." },
+        "suggestion": { "type": "string", "description": "Concrete fix." },
+        "confidence": { "$ref": "#/definitions/confidence" }
+      }
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["approve", "approve-with-nits", "request-changes"]
+    }
+  },
+  "oneOf": [
+    {
+      "title": "SkillReport",
+      "description": "Emitted by scalability or clean-code.",
+      "type": "object",
+      "required": ["type", "skill", "target", "findings", "verdict"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "skill-report" },
+        "skill": { "type": "string", "enum": ["scalability", "clean-code"] },
+        "model": { "type": "string" },
+        "target": { "type": "string", "description": "Path, PR id, or diff identifier reviewed." },
+        "summary": { "type": "string" },
+        "findings": { "type": "array", "items": { "$ref": "#/definitions/finding" } },
+        "verdict": { "$ref": "#/definitions/verdict" }
+      }
+    },
+    {
+      "title": "MergedReport",
+      "description": "Emitted by general after consolidating SkillReports.",
+      "type": "object",
+      "required": ["type", "target", "sources", "findings", "counts", "verdict"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "merged-report" },
+        "target": { "type": "string" },
+        "sources": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["scalability", "clean-code"] },
+          "description": "Which skill reports were merged."
+        },
+        "findings": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/finding" },
+          "description": "Deduped and sorted by severity (blocking first)."
+        },
+        "counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "blocking": { "type": "integer" },
+            "high": { "type": "integer" },
+            "medium": { "type": "integer" },
+            "low": { "type": "integer" },
+            "nit": { "type": "integer" }
+          }
+        },
+        "verdict": { "$ref": "#/definitions/verdict", "description": "Rolled up to the worst-case across sources." },
+        "summary": { "type": "string" },
+        "notes": { "type": "string", "description": "e.g. duplicates collapsed, conflicts between skills." }
+      }
+    }
+  ]
+}
