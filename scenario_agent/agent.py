@@ -106,6 +106,16 @@ def run_agent(app_description: str) -> str:
     return last_message.content
 
 
+def scenario_node(state: dict) -> dict:
+    """LangGraph node — consumes scan_context, produces scenario_output."""
+    scan_context = state.get("scan_context")
+    if scan_context is None:
+        raise ValueError("scenario_node requires scan_context in state")
+    app_description = scan_context.as_prompt_context()
+    scenarios = run_agent(app_description)
+    return {"scenario_output": scenarios}
+
+
 def read_app_description(path: str) -> str:
     content = Path(path).read_text(encoding="utf-8")
     if not content.strip():
