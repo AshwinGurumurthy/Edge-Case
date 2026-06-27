@@ -1,3 +1,11 @@
 .env
 __pycache__/
 *.pyc
+.venv/
+venv/
+*.egg-info/
+
+# scan / scenario outputs
+scan_context.md
+scenarios.md
+*-scenarios.md

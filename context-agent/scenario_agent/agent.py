@@ -1,28 +1,33 @@
 #!/usr/bin/env python3
 """
 Testing scenario generator agent using LangGraph.
-Reads an app description .md file, researches failure patterns via web search,
-and outputs structured testing scenarios to a .md file.
+
+Reads an app description (or a scanner `ScanContext`), optionally researches
+failure patterns via web search, and outputs structured testing scenarios.
+
+Backend selection mirrors the scanner so the pipeline runs with or without keys:
+  - ANTHROPIC_API_KEY set  -> Claude Haiku (web search enabled if TAVILY_API_KEY).
+  - otherwise               -> local Ollama (no web search).
+  - force with SCENARIO_BACKEND=anthropic|ollama.
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from datetime import datetime
 from typing import Annotated
 
+import requests
 from dotenv import load_dotenv
-from langchain_anthropic import ChatAnthropic
-from langchain_tavily import TavilySearch
-from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.graph import START, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode, tools_condition
 from typing_extensions import TypedDict
 
 load_dotenv()
 
-MODEL = "claude-haiku-4-5"
+ANTHROPIC_MODEL = os.getenv("SCENARIO_ANTHROPIC_MODEL", "claude-haiku-4-5")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "granite4:micro")
 
 SYSTEM_PROMPT = """You are a senior QA engineer and testing strategist. Your job is to:
 1. Analyze an app's description, features, and user workflows
@@ -45,65 +50,135 @@ Your final output must be a structured markdown document with:
 
 Be specific and actionable — other automated agents will execute these tests."""
 
+USER_PROMPT = (
+    "Here is the app description:\n\n{desc}\n\n"
+    "Research what applications like this commonly fail at, then generate "
+    "a comprehensive set of testing scenarios, expected outputs, and edge cases. "
+    "Format everything as a clean markdown document."
+)
+
+
+def select_backend() -> str:
+    forced = os.getenv("SCENARIO_BACKEND", "").strip().lower()
+    if forced in ("anthropic", "ollama"):
+        return forced
+    if os.getenv("ANTHROPIC_API_KEY"):
+        return "anthropic"
+    return "ollama"
+
+
+def _has_tavily() -> bool:
+    return bool(os.getenv("TAVILY_API_KEY"))
+
 
 class State(TypedDict):
     messages: Annotated[list, add_messages]
 
 
-def build_graph():
-    tools = [TavilySearch(max_results=5)]
-    model = ChatAnthropic(model=MODEL).bind_tools(tools)
+def _msg_text(msg) -> str:
+    """Normalize an LLM message's content (str or list of blocks) to text."""
+    content = getattr(msg, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in content
+        )
+    return str(content)
+
+
+def _run_anthropic(app_description: str) -> str:
+    from langchain_anthropic import ChatAnthropic
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from langgraph.graph import END, START, StateGraph
+
+    use_search = _has_tavily()
+    model = ChatAnthropic(model=ANTHROPIC_MODEL)
+    tools = []
+    if use_search:
+        from langchain_tavily import TavilySearch
+        from langgraph.prebuilt import ToolNode, tools_condition
+
+        tools = [TavilySearch(max_results=5)]
+        model = model.bind_tools(tools)
+    else:
+        print("[scenario] TAVILY_API_KEY not set — generating without web search.", file=sys.stderr)
 
     def agent_node(state: State):
         return {"messages": [model.invoke(state["messages"])]}
 
-    graph = StateGraph(State)
-    graph.add_node("agent", agent_node)
-    graph.add_node("tools", ToolNode(tools))
-
-    graph.add_edge(START, "agent")
-    graph.add_conditional_edges("agent", tools_condition)
-    graph.add_edge("tools", "agent")
-
-    return graph.compile()
-
-
-def run_agent(app_description: str) -> str:
-    graph = build_graph()
+    graph_builder = StateGraph(State)
+    graph_builder.add_node("agent", agent_node)
+    graph_builder.add_edge(START, "agent")
+    if use_search:
+        graph_builder.add_node("tools", ToolNode(tools))
+        graph_builder.add_conditional_edges("agent", tools_condition)
+        graph_builder.add_edge("tools", "agent")
+    else:
+        graph_builder.add_edge("agent", END)
+    graph = graph_builder.compile()
 
     initial_messages = [
         SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(
-            content=f"Here is the app description:\n\n{app_description}\n\n"
-            "Research what applications like this commonly fail at, then generate "
-            "a comprehensive set of testing scenarios, expected outputs, and edge cases. "
-            "Format everything as a clean markdown document."
-        ),
+        HumanMessage(content=USER_PROMPT.format(desc=app_description)),
     ]
 
-    print("[agent] Starting...", file=sys.stderr)
-    last_message = None
-
+    print("[scenario] Starting (anthropic)...", file=sys.stderr)
+    last_text = ""
     for event in graph.stream(
         {"messages": initial_messages},
         config={"recursion_limit": 25},
         stream_mode="updates",
     ):
         for node_name, update in event.items():
-            messages = update.get("messages", [])
-            for msg in messages:
+            for msg in update.get("messages", []):
                 if node_name == "agent":
-                    if hasattr(msg, "tool_calls") and msg.tool_calls:
+                    if getattr(msg, "tool_calls", None):
                         for tc in msg.tool_calls:
-                            query = tc.get("args", {}).get("query", "")
-                            print(f"[agent] Searching: {query}", file=sys.stderr)
-                    elif hasattr(msg, "content") and msg.content:
-                        print("[agent] Generating scenarios...", file=sys.stderr)
-                        last_message = msg
+                            print(f"[scenario] Searching: {tc.get('args', {}).get('query', '')}", file=sys.stderr)
+                    else:
+                        text = _msg_text(msg)
+                        if text.strip():
+                            last_text = text
                 elif node_name == "tools":
-                    print(f"[tools] Got search results", file=sys.stderr)
+                    print("[scenario] Got search results", file=sys.stderr)
 
-    return last_message.content
+    if not last_text:
+        raise RuntimeError("scenario agent produced no final message")
+    return last_text
+
+
+def _run_ollama(app_description: str) -> str:
+    print("[scenario] Starting (ollama, no web search)...", file=sys.stderr)
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": USER_PROMPT.format(desc=app_description)},
+        ],
+        "stream": False,
+        "options": {"temperature": 0.2},
+    }
+    try:
+        resp = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=600)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Ollama request to {OLLAMA_HOST} failed ({exc}). Is `ollama serve` "
+            f"running and is model '{OLLAMA_MODEL}' pulled?"
+        ) from exc
+    content = resp.json().get("message", {}).get("content", "")
+    if not content.strip():
+        raise RuntimeError("Ollama returned an empty response")
+    return content
+
+
+def run_agent(app_description: str) -> str:
+    backend = select_backend()
+    if backend == "anthropic":
+        return _run_anthropic(app_description)
+    return _run_ollama(app_description)
 
 
 def scenario_node(state: dict) -> dict:
