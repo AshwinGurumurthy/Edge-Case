@@ -136,3 +136,6 @@ class GraphState(TypedDict, total=False):
     scan_context: ScanContext            # the context future agents consume
     scan_meta: dict[str, Any]            # collection stats (files scanned, truncation, root)
     scan_error: str                      # populated only if the scan failed
+
+    # Outputs produced by the scenario node
+    scenario_output: str                 # rendered markdown with testing scenarios
