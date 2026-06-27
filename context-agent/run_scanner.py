@@ -15,6 +15,9 @@ Writes the rendered context to a .md file (default: scan_context.md).
 from __future__ import annotations
 
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
 
 from scanner_agent import build_graph
 
