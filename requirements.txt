@@ -1,0 +1,15 @@
+# --- Multi-Agent Orchestration (WARROOM clone architecture) ---
+# Orchestration graph (nodes / edges / loops / fan-out)
+langgraph>=0.2.0
+langchain-core>=0.3.0
+
+# LLM backends
+requests>=2.31.0        # talks to local Ollama (/api/chat)
+anthropic>=0.40.0       # Context subtree -> Anthropic API
+
+# Config
+python-dotenv>=1.0.0
+anthropic>=0.49
+langgraph>=0.2
+python-dotenv>=1.0
+pydantic>=2.7
